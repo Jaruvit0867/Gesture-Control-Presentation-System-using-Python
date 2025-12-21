@@ -1,756 +1,556 @@
-import cv2
-import mediapipe as mp
-import pyautogui
-import threading
-import tkinter as tk
-from tkinter import ttk, messagebox
-from PIL import Image, ImageTk
-import time
-import math
-from collections import deque
-from queue import SimpleQueue, Queue, Empty
-import ctypes
-
-# ====== Config ======
-CAM_WIDTH = 640
-CAM_HEIGHT = 480
-TARGET_FPS = 30
-PREVIEW_FPS = 30
-SMOOTH_WINDOW = 3
-LERP_ALPHA = 0.35
-SLEEP_NO_HAND = 0.05
-DEBUG_DRAW = False
-SHOW_FPS_ON_STATUS = True
-PREVIEW_W, PREVIEW_H = 400, 300
-MARGIN = 5
-
-# ====== Mediapipe hands ======
-cap = None
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.7, min_tracking_confidence=0.6)
-mp_draw = mp.solutions.drawing_utils
-
-# ====== Helpers ======
-def is_finger_extended(lm, tip_id):
-    return lm[tip_id].y < lm[tip_id - 2].y
-
-def count_fingers_up(lm):
-    return sum(is_finger_extended(lm, i) for i in (8, 12, 16, 20))
-
-def lerp(a, b, alpha):
-    return a + (b - a) * alpha
-
-# ====== State ======
-running = False
-preview_on = False
-status_text = "Idle"
-control_mode = False
-pin_on = False
-preview_win = None
-preview_label = None
-preview_pin_on = False
-preview_pin_btn = None
-x_min, x_max, y_min, y_max = 0.2, 0.8, 0.2, 0.8
-
-# Gesture state
-last_cx, last_time = None, None
-open_start = None
-slide_active = True
-last_swipe_time = 0
-swipe_cooldown = 0.8
-last_zoom_time = 0
-zoom_cooldown = 0.5
-last_click_time = 0
-click_cooldown = 0.8
-dragging = False
-last_cursor_pos = None
-cursor_hist = deque(maxlen=SMOOTH_WINDOW)
-
-two_hand_open_start = None
-two_hand_hold_time = 0.5
-mode_order = ["Cursor", "Slide", "Zoom"]
-prev_mode = "Cursor"
-
-# Queues & threads
-ui_queue = SimpleQueue()
-frame_queue = Queue(maxsize=1)
-cursor_queue = SimpleQueue()
-zoom_queue = SimpleQueue()
-
-cam_thread = None
-det_thread = None
-cur_thread = None
-cursor_running = False
-
-# ====== Threads ======
-def zoom_thread():
-    while running:
-        try:
-            cmd = zoom_queue.get(timeout=0.1)
-            if cmd == "in":
-                try:
-                    pyautogui.hotkey("win", "=")
-                except:
-                    pass
-                try:
-                    pyautogui.hotkey("win", "add")
-                except:
-                    pass
-            elif cmd == "out":
-                try:
-                    pyautogui.hotkey("win", "-")
-                except:
-                    pass
-                try:
-                    pyautogui.hotkey("win", "subtract")
-                except:
-                    pass
-            elif cmd == "close":
-                try:
-                    pyautogui.hotkey("win", "esc")
-                except:
-                    pass
-        except:
-            pass
-
-def fast_move(x, y):
-    ctypes.windll.user32.SetCursorPos(int(x), int(y))
-
-def cursor_thread():
-    global cursor_running
-    cursor_running = True
-    while cursor_running:
-        last = None
-        try:
-            while True:
-                last = cursor_queue.get_nowait()
-        except Empty:
-            pass
-        if last is not None:
-            x, y = last
-            fast_move(x, y)
-        time.sleep(0.016)
-
-# ====== UI helpers ======
-def push_status(text):
-    ui_queue.put(("status", text))
-
-def push_frame(frame_bgr):
-    ui_queue.put(("frame", frame_bgr))
-
-def set_status(text):
-    global status_text
-    status_text = text
-    status_label.config(text=text)
-
-def set_debug(val: bool):
-    global DEBUG_DRAW
-    DEBUG_DRAW = val
-
-# ====== Camera reader ======
-def camera_reader():
-    global cap, running
-    push_status("Camera reader started")
-    while running and cap is not None and cap.isOpened():
-        success, frame = cap.read()
-        if not success or frame is None:
-            time.sleep(0.003)
-            continue
-        if frame_queue.full():
-            try:
-                frame_queue.get_nowait()
-            except Empty:
-                pass
-        frame_queue.put(frame)
-    push_status("Camera reader stopped")
-
-# ====== Main detection loop ======
-def run_detection():
-    global running, control_mode, last_cx, last_time, open_start
-    global slide_active, last_swipe_time, last_zoom_time, last_click_time
-    global last_cursor_pos, cursor_hist, two_hand_open_start, dragging
-
-    screen_w, screen_h = pyautogui.size()
-    frame_interval = 1.0 / float(TARGET_FPS) if TARGET_FPS > 0 else 0.0333
-    fps_avg = deque(maxlen=60)
-    next_tick = time.perf_counter()
-    last_preview_frame = None
-
-    push_status("Starting detection...")
-
-    while running:
-        loop_start = time.perf_counter()
-        now = time.perf_counter()
-        if now < next_tick:
-            time.sleep(next_tick - now)
-        next_tick += frame_interval
-        if next_tick - now > 2 * frame_interval:
-            next_tick = now + frame_interval
-
-        try:
-            img = frame_queue.get_nowait()
-            last_preview_frame = img
-        except Empty:
-            if last_preview_frame is None:
-                push_status("No camera frame")
-                time.sleep(0.005)
-                continue
-            img = last_preview_frame
-
-        img = cv2.flip(img, 1)
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        result = hands.process(img_rgb)
-
-        # Two-hand cycle
-        if result.multi_hand_landmarks and len(result.multi_hand_landmarks) >= 2:
-            h1, h2 = result.multi_hand_landmarks[0], result.multi_hand_landmarks[1]
-            if count_fingers_up(h1.landmark) == 4 and count_fingers_up(h2.landmark) == 4:
-                if two_hand_open_start is None:
-                    two_hand_open_start = now
-                elif now - two_hand_open_start >= two_hand_hold_time:
-                    current = current_mode.get()
-                    idx = mode_order.index(current) if current in mode_order else 0
-                    new_mode = mode_order[(idx + 1) % len(mode_order)]
-                    current_mode.set(new_mode)
-                    push_status(f"Cycle → {new_mode} Mode")
-                    two_hand_open_start = None
-            else:
-                two_hand_open_start = None
-        else:
-            two_hand_open_start = None
-
-        if result.multi_hand_landmarks:
-            for handLms in result.multi_hand_landmarks:
-                lm = handLms.landmark
-                if DEBUG_DRAW:
-                    mp_draw.draw_landmarks(img, handLms, mp_hands.HAND_CONNECTIONS)
-
-                wrist = lm[0]
-                cx, cy = wrist.x, wrist.y
-                now2 = time.perf_counter()
-
-                idx_ext = is_finger_extended(lm, 8)
-                mid_ext = is_finger_extended(lm, 12)
-                ring_ext = is_finger_extended(lm, 16)
-                pink_ext = is_finger_extended(lm, 20)
-                fingers_up_count = (1 if idx_ext else 0) + (1 if mid_ext else 0) + (1 if ring_ext else 0) + (1 if pink_ext else 0)
-
-                index_only = idx_ext and not (mid_ext or ring_ext or pink_ext)
-                two_fingers_drag = idx_ext and mid_ext and not (ring_ext or pink_ext)
-                fist = (fingers_up_count == 0)
-                open4 = (fingers_up_count == 4)
-
-                if open4:
-                    if open_start is None:
-                        open_start = now2
-                    elif now2 - open_start > 2:
-                        control_mode = False
-                        push_status("Reset")
-                else:
-                    open_start = None
-
-                mode = current_mode.get()
-
-                if mode == "Slide":
-                    if fist:
-                        if slide_active:
-                            slide_active = False
-                            push_status("Slide Paused")
-                    else:
-                        if not slide_active and fingers_up_count > 0:
-                            slide_active = True
-                            push_status("Slide Active")
-
-                    if slide_active:
-                        if last_cx is not None and last_time is not None:
-                            dt = now2 - last_time
-                            dx = cx - last_cx
-                            speed = dx / dt if dt > 0 else 0
-                            if abs(speed) > 1.5 and (now2 - last_swipe_time) > swipe_cooldown:
-                                if speed > 0:
-                                    pyautogui.press("right")
-                                    push_status("Next Slide")
-                                else:
-                                    pyautogui.press("left")
-                                    push_status("Prev Slide")
-                                last_swipe_time = now2
-                                last_cx, last_time = None, None
-                            else:
-                                last_cx, last_time = cx, now2
-                        else:
-                            last_cx, last_time = cx, now2
-
-                elif mode == "Cursor":
-                    if two_fingers_drag:
-                        if not dragging:
-                            try:
-                                pyautogui.mouseDown(button="left")
-                                dragging = True
-                                push_status("Left Drag")
-                            except:
-                                pass
-                        nx = (cx - x_min) / (x_max - x_min)
-                        ny = (cy - y_min) / (y_max - y_min)
-                        nx = min(max(nx, 0), 1)
-                        ny = min(max(ny, 0), 1)
-                        x, y = int(nx * screen_w), int(ny * screen_h)
-                        x = min(max(x, MARGIN), screen_w - MARGIN)
-                        y = min(max(y, MARGIN), screen_h - MARGIN)
-
-                        cursor_hist.append((x, y))
-                        avg_x = int(sum(px for px, _ in cursor_hist) / len(cursor_hist))
-                        avg_y = int(sum(py for _, py in cursor_hist) / len(cursor_hist))
-
-                        if last_cursor_pos:
-                            sm_x = lerp(last_cursor_pos[0], avg_x, LERP_ALPHA)
-                            sm_y = lerp(last_cursor_pos[1], avg_y, LERP_ALPHA)
-                            cursor_queue.put((sm_x, sm_y))
-                            last_cursor_pos = (sm_x, sm_y)
-                        else:
-                            cursor_queue.put((avg_x, avg_y))
-                            last_cursor_pos = (avg_x, avg_y)
-
-                    else:
-                        if dragging:
-                            try:
-                                pyautogui.mouseUp(button="left")
-                            except:
-                                pass
-                            dragging = False
-                            push_status("Drag End")
-
-                        if index_only and (time.perf_counter() - last_click_time) > click_cooldown:
-                            if last_cursor_pos:
-                                pyautogui.click(int(last_cursor_pos[0]), int(last_cursor_pos[1]))
-                            else:
-                                pyautogui.click()
-                            push_status("Left Click")
-                            last_click_time = time.perf_counter()
-                        else:
-                            if fist and not control_mode:
-                                control_mode = True
-                                push_status("Mouse Control")
-                            elif (not fist) and control_mode and not index_only:
-                                control_mode = False
-                                push_status("Released")
-
-                            if control_mode and not index_only:
-                                nx = (cx - x_min) / (x_max - x_min)
-                                ny = (cy - y_min) / (y_max - y_min)
-                                nx = min(max(nx, 0), 1)
-                                ny = min(max(ny, 0), 1)
-                                x, y = int(nx * screen_w), int(ny * screen_h)
-                                x = min(max(x, MARGIN), screen_w - MARGIN)
-                                y = min(max(y, MARGIN), screen_h - MARGIN)
-
-                                cursor_hist.append((x, y))
-                                avg_x = int(sum(px for px, _ in cursor_hist) / len(cursor_hist))
-                                avg_y = int(sum(py for _, py in cursor_hist) / len(cursor_hist))
-
-                                if last_cursor_pos:
-                                    sm_x = lerp(last_cursor_pos[0], avg_x, LERP_ALPHA)
-                                    sm_y = lerp(last_cursor_pos[1], avg_y, LERP_ALPHA)
-                                    cursor_queue.put((sm_x, sm_y))
-                                    last_cursor_pos = (sm_x, sm_y)
-                                else:
-                                    cursor_queue.put((avg_x, avg_y))
-                                    last_cursor_pos = (avg_x, avg_y)
-
-                elif mode == "Zoom":
-                    thumb_tip = lm[4]
-                    index_tip = lm[8]
-                    middle_tip = lm[12]
-
-                    dist_index = math.hypot(thumb_tip.x - index_tip.x, thumb_tip.y - index_tip.y)
-                    dist_middle = math.hypot(thumb_tip.x - middle_tip.x, thumb_tip.y - middle_tip.y)
-                    pinch_threshold = 0.05
-
-                    if fist:
-                        nx = (cx - x_min) / (x_max - x_min)
-                        ny = (cy - y_min) / (y_max - y_min)
-                        nx = min(max(nx, 0), 1)
-                        ny = min(max(ny, 0), 1)
-                        x, y = int(nx * screen_w), int(ny * screen_h)
-                        x = min(max(x, MARGIN), screen_w - MARGIN)
-                        y = min(max(y, MARGIN), screen_h - MARGIN)
-
-                        cursor_hist.append((x, y))
-                        avg_x = int(sum(px for px, _ in cursor_hist) / len(cursor_hist))
-                        avg_y = int(sum(py for _, py in cursor_hist) / len(cursor_hist))
-
-                        if last_cursor_pos:
-                            sm_x = lerp(last_cursor_pos[0], avg_x, LERP_ALPHA)
-                            sm_y = lerp(last_cursor_pos[1], avg_y, LERP_ALPHA)
-                            cursor_queue.put((sm_x, sm_y))
-                            last_cursor_pos = (sm_x, sm_y)
-                        else:
-                            cursor_queue.put((avg_x, avg_y))
-                            last_cursor_pos = (avg_x, avg_y)
-
-                        push_status("Cursor Control")
-
-                    elif dist_index < pinch_threshold and (time.perf_counter() - last_zoom_time) > zoom_cooldown and not fist:
-                        zoom_queue.put("in")
-                        push_status("Zoom In")
-                        last_zoom_time = time.perf_counter()
-
-                    elif dist_middle < pinch_threshold and (time.perf_counter() - last_zoom_time) > zoom_cooldown and not fist:
-                        zoom_queue.put("out")
-                        push_status("Zoom Out")
-                        last_zoom_time = time.perf_counter()
-
-                    elif count_fingers_up(lm) == 4:
-                        push_status("Zoom Paused")
-
-        else:
-            push_status("No Hand Detected")
-            time.sleep(SLEEP_NO_HAND)
-
-        if preview_on:
-            disp = cv2.resize(img, (PREVIEW_W, PREVIEW_H))
-            h, w, _ = disp.shape
-            x1, y1 = int(x_min * w), int(y_min * h)
-            x2, y2 = int(x_max * w), int(y_max * h)
-            overlay = disp.copy()
-            cv2.rectangle(overlay, (0, 0), (w, h), (255, 0, 0), -1)
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), -1)
-            disp = cv2.addWeighted(overlay, 0.18, disp, 0.82, 0)
-            cv2.rectangle(disp, (x1, y1), (x2, y2), (255, 0, 0), 2)
-            push_frame(disp)
-
-        dt = time.perf_counter() - loop_start
-        fps = 1.0 / dt if dt > 0 else 0.0
-        fps_avg.append(fps)
-        if SHOW_FPS_ON_STATUS and len(fps_avg) >= 10:
-            ui_queue.put(("fps", sum(fps_avg) / len(fps_avg)))
-
-    push_status("Stopped")
-
-# ====== GUI ======
-def start_detection():
-    global running, cap, cam_thread, det_thread, cur_thread, cursor_running
-    if not running:
-        if cap is None or not cap.isOpened():
-            try:
-                cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-            except:
-                cap = cv2.VideoCapture(0)
-            if cap.isOpened():
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
-                cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
-
-        with frame_queue.mutex:
-            frame_queue.queue.clear()
-        while not cursor_queue.empty():
-            try:
-                cursor_queue.get_nowait()
-            except Empty:
-                break
-
-        running = True
-
-        if not cursor_running:
-            cur_thread = threading.Thread(target=cursor_thread, daemon=True)
-            cur_thread.start()
-
-        threading.Thread(target=zoom_thread, daemon=True).start()
-
-        cam_thread = threading.Thread(target=camera_reader, daemon=True)
-        cam_thread.start()
-
-        det_thread = threading.Thread(target=run_detection, daemon=True)
-        det_thread.start()
-
-        set_status("Starting...")
-
-def stop_detection():
-    global running, cursor_running, dragging
-    running = False
-    cursor_running = False
-    try:
-        if current_mode.get() == "Zoom":
-            zoom_queue.put("close")
-    except:
-        pass
-    if dragging:
-        try:
-            pyautogui.mouseUp(button="left")
-        except:
-            pass
-        dragging = False
-    set_status("Stopped")
-
-# Preview window helpers
-def create_preview_window():
-    global preview_win, preview_label, preview_pin_btn
-    if preview_win is not None:
-        return
-    preview_win = tk.Toplevel(root)
-    preview_win.title("Camera Preview")
-    preview_win.configure(bg="#1E1E1E")
-    preview_win.geometry(f"{PREVIEW_W+40}x{PREVIEW_H+100}")
-    preview_win.wm_attributes("-topmost", preview_pin_on)
-
-    header = tk.Frame(preview_win, bg="#1E1E1E")
-    header.pack(fill="x", pady=6)
-    title = tk.Label(header, text="Live Preview", font=("Segoe UI", 12, "bold"), bg="#1E1E1E", fg="white")
-    title.pack(side="left", padx=10)
-
-    def toggle_preview_pin():
-        global preview_pin_on
-        preview_pin_on = not preview_pin_on
-        if preview_win is not None:
-            preview_win.wm_attributes("-topmost", preview_pin_on)
-        preview_pin_btn.config(text="Unpin" if preview_pin_on else "Pin Top")
-
-    preview_pin_btn = ttk.Button(header, text="Unpin" if preview_pin_on else "Pin Top", style="Rounded.TButton", command=toggle_preview_pin, width=12)
-    preview_pin_btn.pack(side="right", padx=8)
-
-    preview_label = tk.Label(preview_win, bg="#1E1E1E")
-    preview_label.pack(padx=10, pady=10)
-
-    def on_close():
-        global preview_on
-        preview_on = False
-        close_preview_window()
-        preview_btn.config(text="Show Preview")
-    preview_win.protocol("WM_DELETE_WINDOW", on_close)
-
-def close_preview_window():
-    global preview_win, preview_label
-    try:
-        if preview_win is not None:
-            preview_win.destroy()
-    except:
-        pass
-    preview_win = None
-    preview_label = None
-
-def toggle_preview():
-    global preview_on
-    preview_on = not preview_on
-    if preview_on:
-        create_preview_window()
-        preview_btn.config(text="Hide Preview")
-    else:
-        close_preview_window()
-        preview_btn.config(text="Show Preview")
-
-def toggle_pin():
-    global pin_on
-    pin_on = not pin_on
-    root.wm_attributes("-topmost", pin_on)
-    pin_btn.config(text="Unpin" if pin_on else "Pin Top")
-
-def show_help():
-    help_text = """
-Global:
-- Two open hands ~0.5s -> cycle mode
-Slide Mode:
-- Swipe -> change slide
-Cursor Mode:
-- Fist -> control cursor
-- Index only -> click
-- Index+Middle -> drag
-Zoom Mode:
-- Uses Windows Magnifier
-- Thumb+Index -> Zoom In
-- Thumb+Middle -> Zoom Out
+# -*- coding: utf-8 -*-
 """
-    messagebox.showinfo("Help", help_text)
+Presentation Controller - Gesture-based Presentation Controller
+"""
+import threading
+import time
+import queue
+from typing import Optional
 
-def finalize_window_size():
-    root.update_idletasks()
-    w = root.winfo_reqwidth()
-    h = root.winfo_reqheight()
-    root.geometry(f"{w}x{h}")
-    root.minsize(w, h)
-    root.maxsize(w, h)
-    root.resizable(False, False)
+import customtkinter as ctk
+import cv2
 
-# UI pump
-last_fps = None
+from config import AppConfig, Colors, Fonts, Dims, Icons
+from gesture_engine import HandGestureEngine, GestureResult
+from mouse_controller import MouseController
+from ui_renderer import UIRenderer
 
-def set_last_fps(v):
-    global last_fps
-    last_fps = v
-    if SHOW_FPS_ON_STATUS:
-        txt = status_label.cget("text").split("|")[0].strip()
-        status_label.config(text=f"{txt}  |  Det FPS ~ {last_fps:.1f}")
 
-def ui_pump():
-    try:
-        while True:
-            kind, payload = ui_queue.get_nowait()
-            if kind == "status":
-                if SHOW_FPS_ON_STATUS and last_fps is not None:
-                    status_label.config(text=f"{payload}  |  Det FPS ~ {last_fps:.1f}")
-                else:
-                    status_label.config(text=payload)
-            elif kind == "frame":
-                if preview_on and preview_label is not None and preview_win is not None:
-                    frame_bgr = payload
-                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                    img_tk = ImageTk.PhotoImage(Image.fromarray(frame_rgb))
-                    preview_label.config(image=img_tk)
-                    preview_label.image = img_tk
-            elif kind == "fps":
-                set_last_fps(payload)
-    except:
-        pass
-    finally:
-        interval_ms = int(1000 / PREVIEW_FPS) if PREVIEW_FPS > 0 else 33
-        root.after(interval_ms, ui_pump)
+from ui_components import GestureGuideCard, StatusCard, InfoBar
 
-def on_exit():
-    global cap, running, cursor_running, dragging, preview_on
-    try:
-        running = False
-        cursor_running = False
-        time.sleep(0.1)
-        if cap is not None:
+
+class PresentationMouseApp(ctk.CTk):
+    """Main application class"""
+    
+    def __init__(self):
+        super().__init__()
+        
+        self.config = AppConfig()
+        self.engine = HandGestureEngine(self.config)
+        self.mouse = MouseController(self.config)
+        self.renderer = UIRenderer(self.config)
+        
+        self._running = False
+        self._running_lock = threading.Lock()
+        self._pinned = False
+        self._compact_mode = False
+        
+        self._cap: Optional[cv2.VideoCapture] = None
+        self._camera_thread: Optional[threading.Thread] = None
+        self._frame_queue: queue.Queue = queue.Queue(maxsize=2)
+        self._current_tk_image = None
+        
+        self._setup_window()
+        self._init_ui()
+        self._show_full_mode()
+        self._schedule_frame_update()
+
+    def _setup_window(self) -> None:
+        """Configure main window"""
+        ctk.set_appearance_mode("Dark")
+        ctk.set_default_color_theme("dark-blue")
+        self.title("Presentation Controller")
+        self.geometry(f"{Dims.WIDTH}x{Dims.HEIGHT}")
+        self.configure(fg_color=Colors.BG_MAIN)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+    def _init_ui(self) -> None:
+        """Initialize all UI components"""
+        self._init_full_mode_ui()
+        self._init_compact_mode_ui()
+
+    def _init_full_mode_ui(self) -> None:
+        """Create full mode UI layout"""
+        self.full_container = ctk.CTkFrame(self, fg_color="transparent")
+        
+        # === SIDEBAR ===
+        self.sidebar = ctk.CTkFrame(
+            self.full_container,
+            width=Dims.SIDEBAR_WIDTH,
+            fg_color=Colors.BG_SIDEBAR,
+            corner_radius=0
+        )
+        self.sidebar.pack(side="left", fill="y")
+        self.sidebar.pack_propagate(False)
+        
+        # Logo/Header
+        header_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        header_frame.pack(fill="x", padx=20, pady=(25, 20))
+        
+        ctk.CTkLabel(
+            header_frame,
+            text="Presentation Controller",
+            font=Fonts.HEADER,
+            text_color=Colors.ACCENT
+        ).pack(anchor="w")
+        
+        ctk.CTkLabel(
+            header_frame,
+            text="Gesture Control System",
+            font=Fonts.SMALL,
+            text_color=Colors.TEXT_MUTED
+        ).pack(anchor="w")
+        
+        # Status Card
+        self.status_card = StatusCard(self.sidebar)
+        self.status_card.pack(padx=15, pady=(0, 10), fill="x")
+        
+        # Gesture Guide
+        self.gesture_guide = GestureGuideCard(self.sidebar)
+        self.gesture_guide.pack(padx=15, pady=(0, 10), fill="x")
+        
+        # Control Buttons
+        btn_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=15, pady=(5, 10))
+        
+        self.btn_start = ctk.CTkButton(
+            btn_frame,
+            text="▶  START CAMERA",
+            font=Fonts.BUTTON,
+            height=45,
+            fg_color=Colors.ACCENT,
+            hover_color=Colors.ACCENT_LIGHT,
+            text_color=Colors.TEXT_MAIN,
+            corner_radius=10,
+            command=self._toggle_camera
+        )
+        self.btn_start.pack(fill="x", pady=(0, 8))
+        
+        # Secondary buttons row
+        sec_btn_frame = ctk.CTkFrame(btn_frame, fg_color="transparent")
+        sec_btn_frame.pack(fill="x")
+        
+        self.btn_pin = ctk.CTkButton(
+            sec_btn_frame,
+            text=f"{Icons.PIN} Pin",
+            font=Fonts.BUTTON,
+            height=38,
+            width=100,
+            fg_color=Colors.BG_CARD,
+            hover_color=Colors.BG_HOVER,
+            corner_radius=8,
+            command=self._toggle_pin
+        )
+        self.btn_pin.pack(side="left", expand=True, fill="x", padx=(0, 4))
+        
+        self.btn_mode = ctk.CTkButton(
+            sec_btn_frame,
+            text=f"{Icons.ARROW_COMPACT} Compact",
+            font=Fonts.BUTTON,
+            height=38,
+            width=100,
+            fg_color=Colors.BG_CARD,
+            hover_color=Colors.BG_HOVER,
+            corner_radius=8,
+            command=self._toggle_mode
+        )
+        self.btn_mode.pack(side="right", expand=True, fill="x", padx=(4, 0))
+        
+        # Info Bar at bottom
+        self.info_bar = InfoBar(self.sidebar)
+        self.info_bar.pack(side="bottom", fill="x", padx=15, pady=15)
+        
+        # === CAMERA AREA ===
+        cam_container = ctk.CTkFrame(self.full_container, fg_color="transparent")
+        cam_container.pack(side="right", expand=True, fill="both", padx=15, pady=15)
+        
+        # Camera frame with border effect
+        self.cam_frame = ctk.CTkFrame(
+            cam_container,
+            fg_color=Colors.BG_CARD,
+            corner_radius=Dims.CORNER
+        )
+        self.cam_frame.pack(expand=True, fill="both")
+        
+        self._create_cam_label()
+
+    def _create_cam_label(self) -> None:
+        """Create or recreate the camera display label"""
+        if hasattr(self, 'cam_label') and self.cam_label:
             try:
-                cap.release()
-            except:
+                self.cam_label.destroy()
+            except Exception:
                 pass
-        try:
-            zoom_queue.put("close")
-        except:
-            pass
-        if dragging:
-            try:
-                pyautogui.mouseUp(button="left")
-            except:
-                pass
-            dragging = False
-        preview_on = False
-        try:
-            close_preview_window()
-        except:
-            pass
-    finally:
-        try:
-            root.destroy()
-        except:
-            pass
+                
+        self.cam_label = ctk.CTkLabel(
+            self.cam_frame,
+            text="📷\n\nCamera Off\nClick 'START CAMERA' to begin",
+            font=Fonts.SUBHEADER,
+            text_color=Colors.TEXT_MUTED
+        )
+        self.cam_label.place(relx=0.5, rely=0.5, anchor="center")
 
-# ====== Tkinter UI setup ======
-root = tk.Tk()
-root.title("Hand Gesture Presentation Control")
-root.configure(bg="#1E1E1E")
+    def _init_compact_mode_ui(self) -> None:
+        """Create compact mode UI layout"""
+        self.compact_container = ctk.CTkFrame(self, fg_color=Colors.BG_MAIN)
+        
+        # Status area
+        self.c_status_frame = ctk.CTkFrame(
+            self.compact_container,
+            fg_color=Colors.BG_CARD,
+            corner_radius=Dims.CORNER,
+            height=80
+        )
+        self.c_status_frame.pack(padx=12, pady=12, fill="x")
+        self.c_status_frame.pack_propagate(False)
+        
+        c_inner = ctk.CTkFrame(self.c_status_frame, fg_color="transparent")
+        c_inner.place(relx=0.5, rely=0.5, anchor="center")
+        
+        self.lbl_c_indicator = ctk.CTkLabel(
+            c_inner,
+            text=Icons.CIRCLE,
+            font=("Segoe UI", 8),
+            text_color=Colors.TEXT_MUTED
+        )
+        self.lbl_c_indicator.pack()
+        
+        self.lbl_c_status = ctk.CTkLabel(
+            c_inner,
+            text="READY",
+            font=Fonts.STATUS_COMPACT,
+            text_color=Colors.TEXT_SUB
+        )
+        self.lbl_c_status.pack()
+        
+        self.lbl_c_sub = ctk.CTkLabel(
+            c_inner,
+            text="Camera off",
+            font=Fonts.SMALL,
+            text_color=Colors.TEXT_MUTED
+        )
+        self.lbl_c_sub.pack()
+        
+        # Control buttons
+        self.c_ctrl = ctk.CTkFrame(self.compact_container, fg_color="transparent")
+        self.c_ctrl.pack(fill="x", padx=12, pady=(0, 12))
+        
+        self.btn_c_start = ctk.CTkButton(
+            self.c_ctrl,
+            text="▶ START",
+            font=Fonts.BUTTON,
+            height=40,
+            fg_color=Colors.ACCENT,
+            hover_color=Colors.ACCENT_LIGHT,
+            corner_radius=8,
+            command=self._toggle_camera
+        )
+        self.btn_c_start.pack(side="left", expand=True, fill="x", padx=(0, 4))
+        
+        self.btn_c_pin = ctk.CTkButton(
+            self.c_ctrl,
+            text=Icons.PIN,
+            font=Fonts.BUTTON,
+            width=40,
+            height=40,
+            fg_color=Colors.BG_CARD,
+            hover_color=Colors.BG_HOVER,
+            corner_radius=8,
+            command=self._toggle_pin
+        )
+        self.btn_c_pin.pack(side="left", padx=4)
+        
+        self.btn_c_mode = ctk.CTkButton(
+            self.c_ctrl,
+            text=Icons.ARROW_EXPAND,
+            font=Fonts.BUTTON,
+            width=40,
+            height=40,
+            fg_color=Colors.BG_CARD,
+            hover_color=Colors.BG_HOVER,
+            corner_radius=8,
+            command=self._toggle_mode
+        )
+        self.btn_c_mode.pack(side="left")
 
-current_mode = tk.StringVar(value="Cursor")
-current_mode.trace("w", lambda *args: on_mode_change())
+    def _show_full_mode(self) -> None:
+        """Switch to full mode UI"""
+        self.compact_container.pack_forget()
+        self.geometry(f"{Dims.WIDTH}x{Dims.HEIGHT}")
+        self.full_container.pack(fill="both", expand=True)
+        self._compact_mode = False
 
-style = ttk.Style()
-style.theme_use("clam")
-style.configure("Rounded.TButton", font=("Segoe UI", 12), padding=10, relief="flat", background="#2D2D2D", foreground="white")
-style.map("Rounded.TButton", background=[("active", "#3E3E3E")], relief=[("pressed", "sunken")])
+    def _show_compact_mode(self) -> None:
+        """Switch to compact mode UI"""
+        self.full_container.pack_forget()
+        self.geometry(f"{Dims.COMPACT_W}x{Dims.COMPACT_H}")
+        self.compact_container.pack(fill="both", expand=True)
+        self._compact_mode = True
 
-content = tk.Frame(root, bg="#1E1E1E")
-content.pack(side="top", fill="both", padx=10, pady=8)
-
-title_label = tk.Label(content, text="Hand Gesture Presentation Control", font=("Segoe UI", 16, "bold"), bg="#1E1E1E", fg="white")
-title_label.pack(pady=(2, 6))
-
-status_label = tk.Label(content, text="Idle", font=("Segoe UI", 13), bg="#1E1E1E", fg="#00FFAA")
-status_label.pack(pady=(0, 6))
-
-debug_frame = tk.Frame(content, bg="#1E1E1E")
-debug_frame.pack(pady=4)
-debug_var = tk.IntVar(value=1 if DEBUG_DRAW else 0)
-debug_chk = ttk.Checkbutton(debug_frame, text="Debug landmarks", command=lambda: set_debug(bool(debug_var.get())), variable=debug_var)
-debug_chk.pack(side=tk.LEFT, padx=5)
-
-btn_frame = tk.Frame(content, bg="#1E1E1E")
-btn_frame.pack(pady=6)
-
-start_btn = ttk.Button(btn_frame, text="Start", style="Rounded.TButton", command=start_detection, width=12)
-start_btn.grid(row=0, column=0, padx=6, pady=4)
-
-stop_btn = ttk.Button(btn_frame, text="Stop", style="Rounded.TButton", command=stop_detection, width=12)
-stop_btn.grid(row=0, column=1, padx=6, pady=4)
-
-preview_btn = ttk.Button(btn_frame, text="Show Preview", style="Rounded.TButton", command=toggle_preview, width=26)
-preview_btn.grid(row=1, column=0, padx=6, pady=4, columnspan=2)
-
-pin_btn = ttk.Button(btn_frame, text="Pin Top", style="Rounded.TButton", command=toggle_pin, width=26)
-pin_btn.grid(row=2, column=0, padx=6, pady=4, columnspan=2)
-
-help_btn = ttk.Button(btn_frame, text="Help", style="Rounded.TButton", command=show_help, width=26)
-help_btn.grid(row=3, column=0, padx=6, pady=4, columnspan=2)
-
-exit_btn = ttk.Button(btn_frame, text="Exit", style="Rounded.TButton", command=on_exit, width=26)
-exit_btn.grid(row=4, column=0, padx=6, pady=4, columnspan=2)
-
-roi_label = tk.Label(content, text="ROI (Control Area %)", font=("Segoe UI", 11), bg="#1E1E1E", fg="white")
-roi_label.pack(pady=(6, 2))
-
-roi_slider = tk.Scale(content, from_=30, to=100, orient="horizontal", length=360, command=lambda v: update_roi(), bg="#1E1E1E", fg="white", troughcolor="#2D2D2D", highlightthickness=0)
-roi_slider.set(60)
-roi_slider.pack(pady=(0, 4))
-
-mode_bar = tk.Frame(root, bg="#1E1E1E")
-mode_bar.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
-
-mode_buttons = {}
-
-def _apply_mode_button_styles(active):
-    for m, btn in mode_buttons.items():
-        if m == active:
-            btn.state(["pressed"])
+    def _toggle_mode(self) -> None:
+        """Toggle between full and compact mode"""
+        if self._compact_mode:
+            self._show_full_mode()
         else:
-            btn.state(["!pressed"])
+            self._show_compact_mode()
 
-def set_mode(new_mode: str):
-    if current_mode.get() != new_mode:
-        current_mode.set(new_mode)
-    else:
-        _apply_mode_button_styles(new_mode)
-    set_status(f"Switched to {new_mode} Mode")
+    def _toggle_pin(self) -> None:
+        """Toggle window always-on-top"""
+        self._pinned = not self._pinned
+        self.attributes('-topmost', self._pinned)
+        
+        if self._pinned:
+            self.btn_pin.configure(fg_color=Colors.WARNING, text_color=Colors.TEXT_DARK)
+            self.btn_c_pin.configure(fg_color=Colors.WARNING, text_color=Colors.TEXT_DARK)
+        else:
+            self.btn_pin.configure(fg_color=Colors.BG_CARD, text_color=Colors.TEXT_MAIN)
+            self.btn_c_pin.configure(fg_color=Colors.BG_CARD, text_color=Colors.TEXT_MAIN)
 
-def _make_mode_button(text, mode_name):
-    btn = ttk.Button(mode_bar, text=text, style="Rounded.TButton", command=lambda: set_mode(mode_name), width=12)
-    btn.pack(side=tk.LEFT, padx=6)
-    mode_buttons[mode_name] = btn
+    def _toggle_camera(self) -> None:
+        """Toggle camera on/off"""
+        if self._running:
+            self._stop_camera()
+        else:
+            self._start_camera()
 
-_make_mode_button("Cursor", "Cursor")
-_make_mode_button("Slide", "Slide")
-_make_mode_button("Zoom", "Zoom")
+    def _start_camera(self) -> None:
+        """Start camera capture"""
+        self.btn_start.configure(state="disabled", text="⏳ Starting...")
+        self.btn_c_start.configure(state="disabled", text="⏳")
+        self.update()
+        
+        self._cap = cv2.VideoCapture(self.config.cam_index)
+        
+        if not self._cap.isOpened():
+            self._cap = cv2.VideoCapture(1)
+        
+        if not self._cap.isOpened():
+            self._show_error("Camera Error", "Could not open camera")
+            self.btn_start.configure(state="normal", text="▶  START CAMERA")
+            self.btn_c_start.configure(state="normal", text="▶ START")
+            return
+        
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.cam_width)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.cam_height)
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+        with self._running_lock:
+            self._running = True
+        
+        # Clear any existing image before starting
+        self._current_tk_image = None
+        self.cam_label.configure(image=None, text="")
+        
+        self._camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
+        self._camera_thread.start()
+        
+        self._update_button_state()
 
-def on_mode_change():
-    global control_mode, last_cx, last_time, open_start, slide_active, cursor_hist, prev_mode, dragging
-    new_mode = current_mode.get()
+    def _stop_camera(self) -> None:
+        """Stop camera capture"""
+        # Signal thread to stop
+        with self._running_lock:
+            self._running = False
+        
+        # Wait for thread to finish (outside of lock)
+        if self._camera_thread and self._camera_thread.is_alive():
+            self._camera_thread.join(timeout=2.0)
+        
+        # Release camera
+            self._cap.release()
+            self._cap = None
+            # Give the OS a moment to fully release the resource
+            time.sleep(0.2)
+        
+        # Clear UI image by RECREATING the label
+        # This prevents TclError where the widget holds onto dead image references
+        self._create_cam_label()
 
-    if prev_mode == "Zoom" and new_mode != "Zoom":
+        # Then reset state and references
+        self._current_tk_image = None
+        self._camera_thread = None
+        self.mouse.reset_state()
+        self.engine.reset()
+        self.renderer.reset()
+
+        # Clear frame queue to prevent zombie frames
+        while not self._frame_queue.empty():
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                break
+        self.status_card.update_status("READY", "Camera off", Colors.TEXT_SUB, False)
+        self.lbl_c_status.configure(text="READY", text_color=Colors.TEXT_SUB)
+        self.lbl_c_sub.configure(text="Camera off")
+        self.lbl_c_indicator.configure(text_color=Colors.TEXT_MUTED)
+        self.info_bar.update_info(0, self.config.smooth_factor)
+        self._update_button_state()
+
+    def _camera_loop(self) -> None:
+        """Camera capture and processing loop"""
+        while True:
+            with self._running_lock:
+                if not self._running:
+                    break
+            
+            # Additional safety: if this thread is no longer the active camera thread, stop
+            if threading.current_thread() is not self._camera_thread:
+                break
+            
+            if not self._cap or not self._cap.isOpened():
+                break
+            
+            success, frame = self._cap.read()
+            if not success:
+                continue
+            
+            frame = cv2.flip(frame, 1)
+            img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w = frame.shape[:2]
+            
+            result = self.engine.process(img_rgb, w, h)
+            self._handle_gesture(result)
+            
+            if not self._compact_mode:
+                img_drawn = self.renderer.draw(img_rgb, result, self._compact_mode)
+            else:
+                img_drawn = None
+            
+            try:
+                self._frame_queue.put_nowait((result, img_drawn))
+            except queue.Full:
+                pass
+
+    def _handle_gesture(self, result: GestureResult) -> None:
+        """Handle gesture actions"""
+        if result.is_paused:
+            self.mouse.drag_end()
+            return
+        
+        if result.state_name == "DRAGGING" and result.normalized_pos:
+            self.mouse.drag_start()
+            self.mouse.move(*result.normalized_pos)
+        elif result.state_name == "MOVING" and result.normalized_pos:
+            self.mouse.drag_end()
+            self.mouse.move(*result.normalized_pos)
+        elif result.state_name == "SWIPE" and result.swipe_feedback:
+            self.mouse.drag_end()
+            direction = "right" if "NEXT" in result.swipe_feedback else "left"
+            self.mouse.trigger_swipe(direction)
+        else:
+            self.mouse.drag_end()
+
+    def _schedule_frame_update(self) -> None:
+        """Schedule periodic frame updates"""
+        self._process_frame_queue()
+        self.after(16, self._schedule_frame_update)
+
+    def _process_frame_queue(self) -> None:
+        """Process frames from queue and update UI"""
         try:
-            zoom_queue.put("close")
-        except:
+            result, img_drawn = self._frame_queue.get_nowait()
+            
+            # Update status card
+            is_active = result.state_name not in ["SCANNING", "PAUSED"]
+            self.status_card.update_status(
+                result.state_name,
+                result.sub_text,
+                result.ui_color,
+                is_active
+            )
+            
+            # Update compact mode
+            self.lbl_c_status.configure(text=result.state_name, text_color=result.ui_color)
+            self.lbl_c_sub.configure(text=result.sub_text)
+            self.lbl_c_indicator.configure(
+                text_color=Colors.SUCCESS if is_active else Colors.TEXT_MUTED
+            )
+            
+            # Update info bar
+            smooth = self.mouse.get_current_smooth_factor()
+            self.info_bar.update_info(result.confidence, smooth)
+            
+            # Update camera image
+            if img_drawn is not None and not self._compact_mode:
+                display_w = self.cam_frame.winfo_width() - 4
+                display_h = self.cam_frame.winfo_height() - 4
+                
+                tk_img = self.renderer.get_tk_image(img_drawn, display_w, display_h)
+                if tk_img:
+                    self._current_tk_image = tk_img
+                    self.cam_label.configure(image=tk_img)
+                    
+        except queue.Empty:
             pass
-    if new_mode == "Zoom":
-        try:
-            zoom_queue.put("in")
-        except:
-            pass
 
-    control_mode = False
-    last_cx, last_time, open_start = None, None, None
-    slide_active = True
-    cursor_hist.clear()
+    def _update_button_state(self) -> None:
+        """Update button appearance"""
+        if self._running:
+            self.btn_start.configure(
+                text="⏹  STOP CAMERA",
+                fg_color=Colors.DANGER,
+                hover_color=Colors.DANGER_LIGHT,
+                state="normal"
+            )
+            self.btn_c_start.configure(
+                text="⏹ STOP",
+                fg_color=Colors.DANGER,
+                hover_color=Colors.DANGER_LIGHT,
+                state="normal"
+            )
+        else:
+            self.btn_start.configure(
+                text="▶  START CAMERA",
+                fg_color=Colors.ACCENT,
+                hover_color=Colors.ACCENT_LIGHT,
+                state="normal"
+            )
+            self.btn_c_start.configure(
+                text="▶ START",
+                fg_color=Colors.ACCENT,
+                hover_color=Colors.ACCENT_LIGHT,
+                state="normal"
+            )
 
-    if dragging:
-        try:
-            pyautogui.mouseUp(button="left")
-        except:
-            pass
-        dragging = False
+    def _show_error(self, title: str, message: str) -> None:
+        """Show error dialog"""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(title)
+        dialog.geometry("320x160")
+        dialog.configure(fg_color=Colors.BG_MAIN)
+        dialog.transient(self)
+        dialog.grab_set()
+        
+        ctk.CTkLabel(
+            dialog,
+            text="⚠️",
+            font=("Segoe UI", 32)
+        ).pack(pady=(20, 5))
+        
+        ctk.CTkLabel(
+            dialog,
+            text=message,
+            font=Fonts.BODY,
+            text_color=Colors.TEXT_SUB
+        ).pack(pady=5)
+        
+        ctk.CTkButton(
+            dialog,
+            text="OK",
+            command=dialog.destroy,
+            fg_color=Colors.ACCENT,
+            corner_radius=8,
+            width=100
+        ).pack(pady=15)
 
-    prev_mode = new_mode
-    _apply_mode_button_styles(new_mode)
+    def _on_closing(self) -> None:
+        """Handle window close"""
+        with self._running_lock:
+            self._running = False
+        
+        if self._cap:
+            self._cap.release()
+        
+        self.engine.release()
+        self.destroy()
 
-_apply_mode_button_styles("Cursor")
-root.after(int(1000 / PREVIEW_FPS), ui_pump)
-finalize_window_size()
-root.protocol("WM_DELETE_WINDOW", on_exit)
-root.mainloop()
+
+def main():
+    """Application entry point"""
+    app = PresentationMouseApp()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

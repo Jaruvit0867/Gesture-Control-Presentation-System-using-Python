@@ -1,0 +1,16 @@
+# AI Control Pro - Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core
+opencv-python>=4.8.0
+mediapipe>=0.10.0
+pyautogui>=0.9.54
+
+# UI
+customtkinter>=5.2.0
+pillow>=10.0.0
+
+# Optional: For development
+# pytest>=7.0.0
+# black>=23.0.0
+# mypy>=1.0.0
