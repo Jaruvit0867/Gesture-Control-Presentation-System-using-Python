@@ -1,4 +1,4 @@
-# AI Control Pro - Gesture-based Presentation Controller
+# Gesture-based Presentation Controller
 
 A vision-based hand gesture control system for mouse manipulation and presentations.
 
