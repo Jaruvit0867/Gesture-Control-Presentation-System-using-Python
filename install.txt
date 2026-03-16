@@ -1,7 +1,0 @@
-python3.11 -m venv venv
-
-source venv/bin/activate
-
-pip install opencv-python mediapipe pyautogui customtkinter pillow
-
-python main.py

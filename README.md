@@ -1,8 +1,8 @@
 # AI Control Pro - Gesture-based Presentation Controller
 
-ระบบควบคุมเมาส์และนำเสนอด้วยท่าทางมือผ่านกล้อง
+A vision-based hand gesture control system for mouse manipulation and presentations.
 
-## 🚀 การติดตั้ง
+## Installation
 
 ```bash
 python3.11 -m venv venv
@@ -11,79 +11,79 @@ pip install -r requirements.txt
 python main.py
 ```
 
-## ✋ ท่าทางที่รองรับ
+## Supported Gestures
 
-| ท่าทาง | การทำงาน |
-|--------|----------|
-| ☝️ **1 นิ้ว** | เลื่อนเมาส์ |
-| ✌️ **2 นิ้ว** | ลาก (Drag) |
-| 🖐️ **5 นิ้ว** | Swipe ซ้าย/ขวา |
-| ✊ **กำปั้น** | หยุดชั่วคราว |
+| Gesture | Action |
+|---------|--------|
+| **1 Finger** | Move Cursor |
+| **2 Fingers** | Drag |
+| **5 Fingers** | Swipe Left/Right |
+| **Fist** | Pause / Standby |
 
-## 🔧 สิ่งที่ปรับปรุงจากเวอร์ชันเดิม
+## Improvements from the Previous Version
 
 ### 1. Thread Safety
-- เพิ่ม `threading.Lock` สำหรับ `running` state
-- ใช้ `queue.Queue` สำหรับส่งข้อมูลระหว่าง threads แทน direct access
-- เพิ่ม lock สำหรับ drag operations
+- Added `threading.Lock` for the `running` state.
+- Implemented `queue.Queue` for inter-thread data communication instead of direct access.
+- Added lock mechanisms for drag operations.
 
 ### 2. Memory Management
-- แก้ไข memory leak จาก lambda closures
-- เก็บ reference ของ `tk_image` ไว้ใน instance variable
-- เพิ่ม `reset()` methods สำหรับ cleanup
+- Resolved memory leaks caused by lambda closures.
+- Stored `tk_image` references in instance variables to prevent garbage collection issues.
+- Added `reset()` methods for proper cleanup.
 
 ### 3. Gesture Engine
-- **เพิ่มการนับนิ้วโป้ง** - ตรวจจับแกน X แทน Y
-- เพิ่ม `confidence` score ใน result
-- เพิ่ม `finger_count` ใน result
-- ปรับปรุง state machine logic
+- **Thumb Detection:** Evaluates X-axis coordinates instead of Y-axis for accurate thumb counting.
+- Added `confidence` score evaluation in the results.
+- Added `finger_count` evaluation in the results.
+- Improved state machine logic for gesture transitions.
 
 ### 4. Mouse Controller
-- **Adaptive Smoothing** - ปรับค่า smooth ตาม FPS จริง
-- เพิ่ม `min_smooth_factor` และ `max_smooth_factor`
-- Thread-safe drag operations
+- **Adaptive Smoothing:** Dynamically adjusts the smoothing factor based on actual FPS.
+- Introduced `min_smooth_factor` and `max_smooth_factor` configurations.
+- Ensured thread-safe drag operations.
 
 ### 5. UI/UX
-- แก้ไข **Emoji encoding** ใช้ Unicode escape sequences
-- เพิ่ม **Loading state** ขณะเปิดกล้อง
-- เพิ่ม **Error dialog** เมื่อเปิดกล้องไม่ได้
-- แสดง **Finger count indicator** บนหน้าจอ
-- แสดง **State indicator** ที่ด้านบน
-- เพิ่ม **Smooth factor display** ใน sidebar
+- Fixed Unicode escape sequence encoding issues.
+- Implemented a loading state during camera initialization.
+- Added an error dialog for camera access failures.
+- Displayed a finger count indicator directly on the screen.
+- Added a state indicator at the top of the interface.
+- Included a real-time smooth factor display in the sidebar.
 
 ### 6. Performance
-- ใช้ frame queue (maxsize=2) ป้องกัน backlog
-- ลดขนาด buffer ของกล้อง
-- Skip frame เก่าอัตโนมัติ
+- Utilized a frame queue (maxsize=2) to prevent processing backlogs.
+- Reduced the camera buffer size for lower latency.
+- Implemented automatic frame skipping for outdated frames.
 
 ### 7. Code Quality
-- เพิ่ม docstrings ทุก class และ method
-- ใช้ type hints
-- แยก constants ออกมาเป็น classes
-- ใช้ `# -*- coding: utf-8 -*-` header
+- Added comprehensive docstrings to all classes and methods.
+- Enforced strict type hinting throughout the codebase.
+- Refactored constants into dedicated classes.
+- Included `# -*- coding: utf-8 -*-` headers.
 
-## 📁 โครงสร้างไฟล์
+## File Structure
 
 ```
 gesture_app/
-├── config.py          # Configuration, colors, fonts, dimensions
-├── gesture_engine.py  # MediaPipe hand gesture recognition
+├── config.py           # Configuration, colors, fonts, dimensions
+├── gesture_engine.py   # MediaPipe hand gesture recognition
 ├── mouse_controller.py # PyAutoGUI mouse control with smoothing
-├── ui_renderer.py     # OpenCV/PIL image rendering
-├── main.py           # Main application with CustomTkinter UI
-├── requirements.txt  # Dependencies
-└── README.md         # This file
+├── ui_renderer.py      # OpenCV/PIL image rendering
+├── main.py             # Main application with CustomTkinter UI
+├── requirements.txt    # Dependencies
+└── README.md           # This file
 ```
 
-## ⚙️ Configuration
+## Configuration
 
-แก้ไขค่าใน `config.py`:
+Adjust the parameters in `config.py` to customize the system:
 
 ```python
 @dataclass
 class AppConfig:
-    cam_index: int = 0              # Camera index
-    cam_width: int = 1280           # Resolution
+    cam_index: int = 0                  # Camera index
+    cam_width: int = 1280               # Resolution
     cam_height: int = 720
     
     swipe_dist_threshold: float = 0.15  # Swipe sensitivity
@@ -91,11 +91,11 @@ class AppConfig:
     roi_margin: int = 120               # Working area margin
 ```
 
-## 🐛 Known Issues
+## Known Issues
 
-1. บนบาง Linux distro อาจต้องติดตั้ง `python3-tk` แยก
-2. กล้องบางตัวอาจต้องเปลี่ยน `cam_index`
+1. On certain Linux distributions, you may need to install `python3-tk` separately.
+2. The `cam_index` might need to be modified depending on the connected camera hardware.
 
-## 📜 License
+## License
 
 MIT License
